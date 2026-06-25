@@ -1,4 +1,4 @@
-name: Build Release Only
+name: Build AutoGG Button Release
 
 on:
   push:
@@ -8,15 +8,13 @@ on:
 permissions:
   contents: write
 
-# Release/tag를 갱신 중인 실행을 중간에 취소하지 않음.
-# 같은 브랜치의 rolling release를 동시에 수정하는 충돌을 피한다.
 concurrency:
-  group: inventory-touch-follow-release-${{ github.ref_name }}
+  group: autogg-button-release-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:
   NDK_VERSION: 27.2.12479018
-  MODULE_NAME: InventoryTouchFollowProbe
+  MODULE_NAME: AutoGGButton
 
 jobs:
   build-and-release:
@@ -62,7 +60,19 @@ jobs:
           set -euo pipefail
           mkdir -p dist/package
           cp "build-android/lib${MODULE_NAME}.so" "dist/package/lib${MODULE_NAME}.so"
-          cp README.md dist/package/README.md
+          echo "# AutoGG Button Mod" > dist/package/README.md
+          echo "" >> dist/package/README.md
+          echo "Botão flutuante para enviar mensagens automáticas no chat do Minecraft Bedrock." >> dist/package/README.md
+          echo "" >> dist/package/README.md
+          echo "## Como usar:" >> dist/package/README.md
+          echo "- **Clique**: Envia a mensagem configurada no chat" >> dist/package/README.md
+          echo "- **Segure/Pressione**: Abre o menu de configuração para mudar o texto" >> dist/package/README.md
+          echo "- **Arraste**: Move o botão pela tela" >> dist/package/README.md
+          echo "" >> dist/package/README.md
+          echo "## Instalação:" >> dist/package/README.md
+          echo "1. Coloque o .so no launcher (Toolbox, Inner Core, etc)" >> dist/package/README.md
+          echo "2. Inicie o Minecraft" >> dist/package/README.md
+          echo "3. O botão aparecerá automaticamente" >> dist/package/README.md
           (cd dist/package && sha256sum "lib${MODULE_NAME}.so" > "lib${MODULE_NAME}.so.sha256")
           (cd dist/package && zip -9 "../${MODULE_NAME}-arm64-v8a.zip" "lib${MODULE_NAME}.so" "lib${MODULE_NAME}.so.sha256" README.md)
           cp "dist/package/lib${MODULE_NAME}.so" dist/
@@ -77,7 +87,7 @@ jobs:
 
           TAG="continuous-${GITHUB_REF_NAME}"
           TITLE="${MODULE_NAME} continuous (${GITHUB_REF_NAME})"
-          NOTES="Automatic ARM64 test build from commit ${GITHUB_SHA}. This is a JsonUI GameActivity input probe build; it logs mouse and touch motion events without changing Minecraft rendering or input."
+          NOTES="AutoGG Button - Botão flutuante com mensagem customizável para Minecraft Bedrock. Build automático ARM64."
 
           retry() {
             local tries=0
@@ -94,9 +104,6 @@ jobs:
           }
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            # git push --force로 rolling tag를 이동시키면 GitHub가 가끔
-            # 'remote: fatal error in commit_refs'를 반환한다.
-            # 공식 Git reference API로 tag가 최신 커밋을 가리키게 갱신한다.
             retry gh api --method PATCH \
               -H "Accept: application/vnd.github+json" \
               "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
@@ -115,7 +122,6 @@ jobs:
               --notes "$NOTES" \
               --prerelease
           else
-            # 태그/릴리즈가 아직 없으면 GitHub CLI가 현재 커밋에 새 태그를 생성한다.
             retry gh release create "$TAG" \
               "dist/${MODULE_NAME}-arm64-v8a.zip" \
               "dist/lib${MODULE_NAME}.so" \
