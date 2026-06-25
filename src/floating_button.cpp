@@ -1,4 +1,3 @@
-
 #include "floating_button.h"
 #include "config.h"
 #include <android/log.h>
@@ -6,79 +5,58 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <atomic>
-#include <string>
 
 namespace {
-
 constexpr const char* kLogTag = "AutoGGButton";
-
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, kLogTag, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, kLogTag, __VA_ARGS__)
-
 JavaVM* g_vm = nullptr;
 std::atomic<bool> g_running{false};
 pthread_t g_buttonThread;
-
-extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
-    g_vm = vm;
-    return JNI_VERSION_1_6;
 }
 
-void* ButtonThread(void* /*arg*/) {
+namespace FloatingButton {
+void SetJVM(JavaVM* vm) { g_vm = vm; }
+
+void* ButtonThread(void*) {
+    if (!g_vm) { LOGE("JVM not set"); return nullptr; }
+    
     JNIEnv* env = nullptr;
     if (g_vm->AttachCurrentThread(&env, nullptr) != 0) {
-        LOGE("Failed to attach thread to JVM");
-        return nullptr;
+        LOGE("Failed to attach thread"); return nullptr;
     }
     
     jclass activityClass = env->FindClass("com/mojang/minecraftpe/MainActivity");
-    if (!activityClass) {
-        LOGE("MainActivity not found");
-        g_vm->DetachCurrentThread();
-        return nullptr;
-    }
+    if (!activityClass) { LOGE("MainActivity not found"); g_vm->DetachCurrentThread(); return nullptr; }
     
     jmethodID getInstance = env->GetStaticMethodID(activityClass, "getInstance", "()Lcom/mojang/minecraftpe/MainActivity;");
-    if (!getInstance) {
-        LOGE("getInstance not found");
-        g_vm->DetachCurrentThread();
-        return nullptr;
-    }
+    if (!getInstance) { LOGE("getInstance not found"); g_vm->DetachCurrentThread(); return nullptr; }
     
     jobject activity = env->CallStaticObjectMethod(activityClass, getInstance);
-    if (!activity) {
-        LOGE("Could not get MainActivity instance");
-        g_vm->DetachCurrentThread();
-        return nullptr;
-    }
+    if (!activity) { LOGE("No activity"); g_vm->DetachCurrentThread(); return nullptr; }
     
-    LOGI("Attempting to create floating button...");
+    LOGI("Floating button ready");
     
-    // Aqui você injetaria o código Java do botão flutuante
-    // via DexClassLoader ou reflection na Activity
+    // Teste: mostra Toast
+    jclass toastClass = env->FindClass("android/widget/Toast");
+    jmethodID makeText = env->GetStaticMethodID(toastClass, "makeText", "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;");
+    jstring msg = env->NewStringUTF("AutoGG Button Loaded!");
+    jobject toast = env->CallStaticObjectMethod(toastClass, makeText, activity, msg, 1);
+    jmethodID show = env->GetMethodID(toastClass, "show", "()V");
+    env->CallVoidMethod(toast, show);
+    env->DeleteLocalRef(msg);
     
     g_vm->DetachCurrentThread();
     return nullptr;
 }
 
-}
-
-namespace FloatingButton {
-
 void Start() {
-    if (g_running.load(std::memory_order_acquire)) {
-        return;
-    }
-    g_running.store(true, std::memory_order_release);
-    
-    usleep(3000 * 1000);
-    
+    if (g_running.load()) return;
+    g_running.store(true);
+    usleep(5000 * 1000);
     pthread_create(&g_buttonThread, nullptr, ButtonThread, nullptr);
     pthread_detach(g_buttonThread);
 }
 
-void Stop() {
-    g_running.store(false, std::memory_order_release);
+void Stop() { g_running.store(false); }
 }
-
-} // namespace FloatingButton
