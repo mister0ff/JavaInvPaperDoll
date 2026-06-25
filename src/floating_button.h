@@ -1,8 +1,9 @@
 #pragma once
-#include <jni.h>
 
 namespace FloatingButton {
-    void SetJVM(JavaVM* vm);
     void Start();
     void Stop();
+    bool IsInsideButtonArea(float x, float y);
+    void HandleTouchDown(float x, float y);
+    void HandleTouchUp(float x, float y);
 }
