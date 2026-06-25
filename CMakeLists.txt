@@ -1,49 +1,32 @@
 cmake_minimum_required(VERSION 3.22)
+project(AutoGGButton)
 
-project(InventoryTouchFollowProbe LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(NOT ANDROID)
-    message(FATAL_ERROR "Android NDK toolchain is required.")
-endif()
+find_library(ANDROID_LOG_LIB log)
+find_library(ANDROID_DL_LIB dl)
 
-if(NOT ANDROID_ABI STREQUAL "arm64-v8a")
-    message(FATAL_ERROR "Only arm64-v8a is supported for the located Minecraft Bedrock hooks.")
-endif()
-
-add_library(InventoryTouchFollowProbe SHARED
+add_library(${PROJECT_NAME} SHARED
     src/main.cpp
+    src/floating_button.cpp
+    src/chat_sender.cpp
+    src/config.cpp
 )
 
-target_compile_features(InventoryTouchFollowProbe PRIVATE cxx_std_20)
-target_compile_options(InventoryTouchFollowProbe PRIVATE
-    -O2
+target_include_directories(${PROJECT_NAME} PRIVATE src)
+
+target_link_libraries(${PROJECT_NAME}
+    ${ANDROID_LOG_LIB}
+    ${ANDROID_DL_LIB}
+    jnigraphics
+)
+
+target_compile_options(${PROJECT_NAME} PRIVATE
+    -O3
+    -fvisibility=hidden
+    -fno-exceptions
+    -fno-rtti
     -Wall
     -Wextra
-    -Wpedantic
-    -fvisibility=hidden
-    -ffunction-sections
-    -fdata-sections
 )
-target_link_options(InventoryTouchFollowProbe PRIVATE
-    -Wl,--gc-sections
-    -Wl,--strip-all
-)
-
-find_library(log_lib log REQUIRED)
-find_library(android_lib android REQUIRED)
-find_library(dl_lib dl REQUIRED)
-
-target_link_libraries(InventoryTouchFollowProbe PRIVATE
-    ${log_lib}
-    ${android_lib}
-    ${dl_lib}
-)
-
-set_target_properties(InventoryTouchFollowProbe PROPERTIES
-    OUTPUT_NAME "InventoryTouchFollowProbe"
-)
-
-# Runtime dependency only:
-# LeviLauncher supplies libpreloader.so. This test module resolves GlossHook
-# APIs from that already-loaded preloader at runtime, so CI does not rebuild or
-# redistribute a separate preloader binary.
