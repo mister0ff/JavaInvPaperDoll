@@ -1,62 +1,83 @@
 #include "floating_button.h"
 #include "config.h"
+#include "chat_sender.h"
 #include <android/log.h>
-#include <jni.h>
-#include <pthread.h>
-#include <unistd.h>
 #include <atomic>
+#include <chrono>
 
 namespace {
+
 constexpr const char* kLogTag = "AutoGGButton";
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, kLogTag, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, kLogTag, __VA_ARGS__)
-JavaVM* g_vm = nullptr;
-std::atomic<bool> g_running{false};
-pthread_t g_buttonThread;
+
+// Área do "botão virtual": canto superior direito
+// Ajuste conforme sua tela! (valores em % da tela)
+constexpr float kButtonX = 0.80f;      // 80% da largura
+constexpr float kButtonY = 0.02f;      // 2% da altura (topo)
+constexpr float kButtonWidth = 0.18f;   // 18% da largura
+constexpr float kButtonHeight = 0.10f;  // 10% da altura
+
+constexpr int64_t kLongPressMs = 600;
+
+std::atomic<bool> g_touchingButton{false};
+std::atomic<int64_t> g_touchStartTime{0};
+
+int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-namespace FloatingButton {
-void SetJVM(JavaVM* vm) { g_vm = vm; }
+} // namespace
 
-void* ButtonThread(void*) {
-    if (!g_vm) { LOGE("JVM not set"); return nullptr; }
+namespace FloatingButton {
+
+bool IsInsideButtonArea(float x, float y) {
+    // Assumindo tela 1080x2400 como base - ajuste se necessário
+    float screenW = 1080.0f;
+    float screenH = 2400.0f;
     
-    JNIEnv* env = nullptr;
-    if (g_vm->AttachCurrentThread(&env, nullptr) != 0) {
-        LOGE("Failed to attach thread"); return nullptr;
+    float btnLeft = kButtonX * screenW;
+    float btnRight = (kButtonX + kButtonWidth) * screenW;
+    float btnTop = kButtonY * screenH;
+    float btnBottom = (kButtonY + kButtonHeight) * screenH;
+    
+    return (x >= btnLeft && x <= btnRight && y >= btnTop && y <= btnBottom);
+}
+
+void HandleTouchDown(float x, float y) {
+    if (IsInsideButtonArea(x, y)) {
+        g_touchingButton.store(true);
+        g_touchStartTime.store(NowMs());
+        LOGI("Touch START in button area (%.0f, %.0f)", x, y);
     }
+}
+
+void HandleTouchUp(float x, float y) {
+    if (!g_touchingButton.load()) return;
     
-    jclass activityClass = env->FindClass("com/mojang/minecraftpe/MainActivity");
-    if (!activityClass) { LOGE("MainActivity not found"); g_vm->DetachCurrentThread(); return nullptr; }
+    int64_t duration = NowMs() - g_touchStartTime.load();
+    g_touchingButton.store(false);
     
-    jmethodID getInstance = env->GetStaticMethodID(activityClass, "getInstance", "()Lcom/mojang/minecraftpe/MainActivity;");
-    if (!getInstance) { LOGE("getInstance not found"); g_vm->DetachCurrentThread(); return nullptr; }
-    
-    jobject activity = env->CallStaticObjectMethod(activityClass, getInstance);
-    if (!activity) { LOGE("No activity"); g_vm->DetachCurrentThread(); return nullptr; }
-    
-    LOGI("Floating button ready");
-    
-    // Teste: mostra Toast
-    jclass toastClass = env->FindClass("android/widget/Toast");
-    jmethodID makeText = env->GetStaticMethodID(toastClass, "makeText", "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;");
-    jstring msg = env->NewStringUTF("AutoGG Button Loaded!");
-    jobject toast = env->CallStaticObjectMethod(toastClass, makeText, activity, msg, 1);
-    jmethodID show = env->GetMethodID(toastClass, "show", "()V");
-    env->CallVoidMethod(toast, show);
-    env->DeleteLocalRef(msg);
-    
-    g_vm->DetachCurrentThread();
-    return nullptr;
+    if (duration >= kLongPressMs) {
+        LOGI("LONG PRESS (%lld ms) - Config mode", duration);
+        // TODO: abrir dialog de config
+        ChatSender::Send("/say [AutoGG] Config: " + Config::GetMessage());
+    } else {
+        LOGI("CLICK (%lld ms) - Sending message!", duration);
+        ChatSender::Send(Config::GetMessage());
+    }
 }
 
 void Start() {
-    if (g_running.load()) return;
-    g_running.store(true);
-    usleep(5000 * 1000);
-    pthread_create(&g_buttonThread, nullptr, ButtonThread, nullptr);
-    pthread_detach(g_buttonThread);
+    LOGI("AutoGG touch area active!");
+    LOGI("Touch the TOP-RIGHT corner of screen to send message");
+    LOGI("Area: X=%.0f%%-%.0f%%, Y=%.0f%%-%.0f%%", 
+         kButtonX*100, (kButtonX+kButtonWidth)*100,
+         kButtonY*100, (kButtonY+kButtonHeight)*100);
 }
 
-void Stop() { g_running.store(false); }
+void Stop() {
+    g_touchingButton.store(false);
 }
+
+} // namespace FloatingButton
