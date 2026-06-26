@@ -6,33 +6,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_library(ANDROID_LOG_LIB log)
 find_library(ANDROID_DL_LIB dl)
-find_library(EGL_LIB EGL)
-find_library(GLES3_LIB GLESv3)
 
-add_library(${PROJECT_NAME} SHARED
-    src/main.cpp
-    src/jni_bridge.cpp
-    src/render_overlay.cpp
-    src/floating_button.cpp
-    src/chat_sender.cpp
-    src/config.cpp
-)
-
-target_include_directories(${PROJECT_NAME} PRIVATE src)
+add_library(${PROJECT_NAME} SHARED src/main.cpp)
 
 target_link_libraries(${PROJECT_NAME}
     ${ANDROID_LOG_LIB}
     ${ANDROID_DL_LIB}
-    ${EGL_LIB}
-    ${GLES3_LIB}
-    jnigraphics
 )
 
-target_compile_options(${PROJECT_NAME} PRIVATE
-    -O3
-    -fvisibility=hidden
-    -fno-exceptions
-    -fno-rtti
-    -Wall
-    -Wextra
-)
+target_compile_options(${PROJECT_NAME} PRIVATE -O3 -fvisibility=hidden -Wall)
