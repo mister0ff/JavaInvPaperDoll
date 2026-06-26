@@ -3,168 +3,149 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <EGL/egl.h>
-#include <GLES3/gl3.h>
-
-#include <atomic>
-#include <cstdint>
 #include <cstring>
 
-#include "render_overlay.h"
-#include "chat_sender.h"
-#include "config.h"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "AutoGG", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "AutoGG", __VA_ARGS__)
 
-namespace {
-constexpr const char* kLogTag = "AutoGGButton";
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, kLogTag, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, kLogTag, __VA_ARGS__)
+// ============================================================
+// TUDO EM UM ARQUIVO - MOD SIMPLES
+// Toque na tela = envia mensagem no chat
+// ============================================================
 
 using GlossInitFn = void (*)(bool);
 using GlossHookFn = void* (*)(void*, void*, void**);
-using MotionEventFromJavaFn = void (*)(JNIEnv*, jobject, std::byte*);
-using EglSwapBuffersFn = EGLBoolean (*)(EGLDisplay, EGLSurface);
+using MotionEventFromJavaFn = void (*)(JNIEnv*, jobject, void*);
 
-GlossInitFn g_glossInit = nullptr;
-GlossHookFn g_glossHook = nullptr;
-MotionEventFromJavaFn g_oldMotionEventFromJava = nullptr;
-void* g_motionHook = nullptr;
-EglSwapBuffersFn g_origEglSwapBuffers = nullptr;
+static GlossInitFn g_glossInit = nullptr;
+static GlossHookFn g_glossHook = nullptr;
+static MotionEventFromJavaFn g_oldMotion = nullptr;
+static void* g_motionHook = nullptr;
 
-// Motion event layout
-constexpr std::size_t kEventSourceOffset = 0x04;
-constexpr std::size_t kEventActionOffset = 0x08;
-constexpr std::size_t kEventPointerCountOffset = 0x38;
-constexpr std::size_t kFirstPointerOffset = 0x3C;
-constexpr std::size_t kPointerToolTypeOffset = 0x04;
-constexpr std::size_t kPointerAxisXOffset = 0x08;
-constexpr std::size_t kPointerAxisYOffset = 0x0C;
-constexpr std::int32_t kActionMask = 0xFF;
-constexpr std::int32_t kSourceTouchscreen = 0x00001002;
-constexpr std::int32_t kToolFinger = 1;
-constexpr std::int32_t kActionDown = 0;
-constexpr std::int32_t kActionUp = 1;
-constexpr std::int32_t kActionCancel = 3;
+// Layout GameActivityMotionEvent (do seu mod original)
+static const int SRC_OFF = 0x04;
+static const int ACT_OFF = 0x08;
+static const int PTR_OFF = 0x38;
+static const int FIRST_PTR = 0x3C;
+static const int PTR_STRIDE = 0xD0;
+static const int TOOL_OFF = 0x04;
+static const int X_OFF = 0x08;
+static const int Y_OFF = 0x0C;
 
-template <typename T>
-T ReadValue(const std::byte* base, std::size_t offset) {
-    T value{};
-    std::memcpy(&value, base + offset, sizeof(T));
-    return value;
+static const int SRC_TOUCH = 0x00001002;
+static const int TOOL_FINGER = 1;
+static const int ACT_DOWN = 0;
+static const int ACT_UP = 1;
+
+static int g_cooldown = 0;
+
+// ============================================================
+// ENVIA MENSAGEM NO CHAT VIA JNI
+// ============================================================
+static void SendChat(const char* msg) {
+    JavaVM* vm = nullptr;
+    JNI_GetCreatedJavaVMs(&vm, 1, nullptr);
+    if (!vm) { LOGE("No JVM"); return; }
+    
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        LOGE("No JNIEnv"); return;
+    }
+    
+    jclass mc = env->FindClass("com/mojang/minecraftpe/MainActivity");
+    if (!mc) { LOGE("No MainActivity class"); return; }
+    
+    jmethodID getInst = env->GetStaticMethodID(mc, "getInstance", "()Lcom/mojang/minecraftpe/MainActivity;");
+    if (!getInst) { LOGE("No getInstance"); return; }
+    
+    jobject activity = env->CallStaticObjectMethod(mc, getInst);
+    if (!activity) { LOGE("No activity"); return; }
+    
+    // Tenta enviar chat
+    jmethodID send = env->GetMethodID(mc, "nativeSendChatMessage", "(Ljava/lang/String;)V");
+    if (!send) send = env->GetMethodID(mc, "sendChatMessage", "(Ljava/lang/String;)V");
+    if (!send) send = env->GetMethodID(mc, "sendMessage", "(Ljava/lang/String;)V");
+    
+    if (send) {
+        jstring jmsg = env->NewStringUTF(msg);
+        env->CallVoidMethod(activity, send, jmsg);
+        env->DeleteLocalRef(jmsg);
+        LOGI("CHAT SENT: %s", msg);
+    } else {
+        LOGE("No chat method found");
+    }
 }
 
-bool ResolvePreloaderApi() {
-#ifndef RTLD_NOLOAD
-#define RTLD_NOLOAD 0x00004
-#endif
-    void* preloader = nullptr;
-    for (int attempt = 0; attempt < 120 && preloader == nullptr; ++attempt) {
-        preloader = dlopen("libpreloader.so", RTLD_NOW | RTLD_NOLOAD);
-        if (!preloader) usleep(250 * 1000);
+// ============================================================
+// HOOK DO TOUCH
+// ============================================================
+static void HookMotion(JNIEnv* env, jobject ev, void* out) {
+    if (g_oldMotion) g_oldMotion(env, ev, out);
+    if (!out) return;
+    
+    char* p = (char*)out;
+    int src = *(int*)(p + SRC_OFF);
+    int act = *(int*)(p + ACT_OFF) & 0xFF;
+    int n = *(int*)(p + PTR_OFF);
+    
+    if (src != SRC_TOUCH || n < 1) return;
+    
+    char* ptr = p + FIRST_PTR;
+    int tool = *(int*)(ptr + TOOL_OFF);
+    if (tool != TOOL_FINGER) return;
+    
+    float x = *(float*)(ptr + X_OFF);
+    float y = *(float*)(ptr + Y_OFF);
+    
+    // Só envia no ACT_DOWN (quando toca) com cooldown
+    if (act == ACT_DOWN && g_cooldown <= 0) {
+        g_cooldown = 30; // ~0.5s cooldown
+        LOGI("TOUCH at (%.0f, %.0f) -> sending AUTO GG", x, y);
+        SendChat("AUTO GG");
     }
-    if (!preloader) { LOGE("libpreloader.so not loaded"); return false; }
-    g_glossInit = reinterpret_cast<GlossInitFn>(dlsym(preloader, "GlossInit"));
-    g_glossHook = reinterpret_cast<GlossHookFn>(dlsym(preloader, "GlossHook"));
-    if (!g_glossInit || !g_glossHook) { LOGE("preloader exports missing"); return false; }
+    
+    if (g_cooldown > 0) g_cooldown--;
+}
+
+// ============================================================
+// INICIALIZAÇÃO
+// ============================================================
+static void* InitThread(void*) {
+    LOGI("=== AutoGG Simple Mod v1.0 ===");
+    LOGI("Touch anywhere on screen to send AUTO GG");
+    
+    // Espera preloader
+    void* pre = nullptr;
+    for (int i = 0; i < 120 && !pre; i++) {
+        pre = dlopen("libpreloader.so", RTLD_NOW | 0x00004);
+        if (!pre) usleep(250000);
+    }
+    if (!pre) { LOGE("No preloader"); return nullptr; }
+    
+    g_glossInit = (GlossInitFn)dlsym(pre, "GlossInit");
+    g_glossHook = (GlossHookFn)dlsym(pre, "GlossHook");
+    if (!g_glossInit || !g_glossHook) { LOGE("No Gloss exports"); return nullptr; }
     g_glossInit(true);
-    return true;
-}
-
-// ===== RENDER HOOK =====
-static EGLBoolean HookEglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    if (!g_origEglSwapBuffers) return EGL_FALSE;
-    EGLint w = 0, h = 0;
-    eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
-    eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-    if (w > 100 && h > 100) {
-        RenderOverlay::SetScreenSize(w, h);
-        RenderOverlay::Render();
+    
+    // Hook motion event
+    void* mc = dlopen("libminecraftpe.so", RTLD_NOW | 0x00004);
+    if (!mc) { LOGE("No libminecraftpe"); return nullptr; }
+    
+    void* motion = dlsym(mc, "GameActivityMotionEvent_fromJava");
+    if (!motion) { LOGE("No motion event"); return nullptr; }
+    
+    g_motionHook = g_glossHook(motion, (void*)HookMotion, (void**)&g_oldMotion);
+    if (!g_motionHook || !g_oldMotion) {
+        LOGE("Hook failed"); return nullptr;
     }
-    return g_origEglSwapBuffers(dpy, surf);
-}
-
-// ===== TOUCH HOOK =====
-void HookMotionEventFromJava(JNIEnv* env, jobject javaMotionEvent, std::byte* outEvent) {
-    if (!g_oldMotionEventFromJava) return;
-    g_oldMotionEventFromJava(env, javaMotionEvent, outEvent);
-    if (!outEvent) return;
-
-    const std::int32_t source = ReadValue<std::int32_t>(outEvent, kEventSourceOffset);
-    const std::int32_t actionRaw = ReadValue<std::int32_t>(outEvent, kEventActionOffset);
-    const std::int32_t action = actionRaw & kActionMask;
-    const std::int32_t pointerCount = ReadValue<std::int32_t>(outEvent, kEventPointerCountOffset);
-    if (source != kSourceTouchscreen || pointerCount < 1) return;
-
-    const std::size_t pointer = kFirstPointerOffset;
-    const std::int32_t tool = ReadValue<std::int32_t>(outEvent, pointer + kPointerToolTypeOffset);
-    if (tool != kToolFinger) return;
-
-    const float x = ReadValue<float>(outEvent, pointer + kPointerAxisXOffset);
-    const float y = ReadValue<float>(outEvent, pointer + kPointerAxisYOffset);
-
-    if (action == kActionDown && pointerCount == 1) {
-        if (RenderOverlay::IsInsideButton(x, y)) {
-            RenderOverlay::SetButtonPressed(true);
-            LOGI("Button pressed at (%.0f, %.0f)", x, y);
-        }
-    } else if ((action == kActionUp || action == kActionCancel) && pointerCount == 1) {
-        RenderOverlay::SetButtonPressed(false);
-    }
-}
-
-bool InstallMotionHook() {
-#ifndef RTLD_NOLOAD
-#define RTLD_NOLOAD 0x00004
-#endif
-    void* minecraft = dlopen("libminecraftpe.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!minecraft) { LOGE("libminecraftpe.so not loaded"); return false; }
-    void* motionTarget = dlsym(minecraft, "GameActivityMotionEvent_fromJava");
-    if (!motionTarget) { LOGE("GameActivityMotionEvent_fromJava not found"); return false; }
-    g_motionHook = g_glossHook(
-        motionTarget,
-        reinterpret_cast<void*>(&HookMotionEventFromJava),
-        reinterpret_cast<void**>(&g_oldMotionEventFromJava));
-    if (!g_motionHook || !g_oldMotionEventFromJava) {
-        LOGE("Motion event hook failed"); return false;
-    }
-    LOGI("Motion hook installed!");
-    return true;
-}
-
-bool InstallRenderHook() {
-#ifndef RTLD_NOLOAD
-#define RTLD_NOLOAD 0x00004
-#endif
-    void* egl = dlopen("libEGL.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!egl) { LOGE("libEGL.so not loaded"); return false; }
-    void* swap = dlsym(egl, "eglSwapBuffers");
-    if (!swap) { LOGE("eglSwapBuffers not found"); return false; }
-    void* hook = g_glossHook(
-        swap,
-        reinterpret_cast<void*>(&HookEglSwapBuffers),
-        reinterpret_cast<void**>(&g_origEglSwapBuffers));
-    if (!hook || !g_origEglSwapBuffers) {
-        LOGE("eglSwapBuffers hook failed"); return false;
-    }
-    LOGI("Render hook installed! Blue button will appear top-right.");
-    return true;
-}
-
-void* InitThread(void*) {
-    LOGI("AutoGG Button v2.0 (OpenGL overlay)");
-    Config::Load();
-    if (ResolvePreloaderApi()) {
-        InstallMotionHook();
-        InstallRenderHook();
-    }
+    
+    LOGI("HOOK OK! Touch screen to send AUTO GG");
     return nullptr;
 }
 
-} // namespace
-
-__attribute__((constructor)) void ModConstructor() {
-    pthread_t thread{};
-    if (pthread_create(&thread, nullptr, &InitThread, nullptr) != 0) {
-        LOGE("failed to create init thread"); return;
-    }
-    pthread_detach(thread);
+__attribute__((constructor))
+void ModConstructor() {
+    pthread_t t;
+    pthread_create(&t, nullptr, InitThread, nullptr);
+    pthread_detach(t);
 }
