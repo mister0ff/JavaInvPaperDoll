@@ -21,13 +21,13 @@ static GlossInitFn g_glossInit = nullptr;
 static GlossHookFn g_glossHook = nullptr;
 static MotionEventFromJavaFn g_oldMotion = nullptr;
 static void* g_motionHook = nullptr;
+static JavaVM* g_vm = nullptr;
 
 // Layout GameActivityMotionEvent (do seu mod original)
 static const int SRC_OFF = 0x04;
 static const int ACT_OFF = 0x08;
 static const int PTR_OFF = 0x38;
 static const int FIRST_PTR = 0x3C;
-static const int PTR_STRIDE = 0xD0;
 static const int TOOL_OFF = 0x04;
 static const int X_OFF = 0x08;
 static const int Y_OFF = 0x0C;
@@ -35,20 +35,17 @@ static const int Y_OFF = 0x0C;
 static const int SRC_TOUCH = 0x00001002;
 static const int TOOL_FINGER = 1;
 static const int ACT_DOWN = 0;
-static const int ACT_UP = 1;
 
 static int g_cooldown = 0;
 
 // ============================================================
-// ENVIA MENSAGEM NO CHAT VIA JNI
+// ENVIA MENSAGEM NO CHAT VIA JNI (usando JVM capturada)
 // ============================================================
 static void SendChat(const char* msg) {
-    JavaVM* vm = nullptr;
-    JNI_GetCreatedJavaVMs(&vm, 1, nullptr);
-    if (!vm) { LOGE("No JVM"); return; }
+    if (!g_vm) { LOGE("No JVM captured"); return; }
     
     JNIEnv* env = nullptr;
-    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+    if (g_vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
         LOGE("No JNIEnv"); return;
     }
     
@@ -105,6 +102,15 @@ static void HookMotion(JNIEnv* env, jobject ev, void* out) {
     }
     
     if (g_cooldown > 0) g_cooldown--;
+}
+
+// ============================================================
+// JNI_OnLoad - CAPTURA A JVM AUTOMATICAMENTE
+// ============================================================
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    g_vm = vm;
+    LOGI("JNI_OnLoad: JVM captured");
+    return JNI_VERSION_1_6;
 }
 
 // ============================================================
