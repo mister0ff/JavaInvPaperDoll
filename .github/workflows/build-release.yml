@@ -30,16 +30,15 @@ jobs:
         submodules: recursive
 
     # ============================================
-    # Setup Android NDK
+    # Setup Android NDK (via action oficial)
     # ============================================
     - name: Setup Android NDK
-      uses: android-actions/setup-android@v3
-
-    - name: Install NDK
-      run: |
-        sdkmanager "ndk;25.2.9658665"
-        echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9658665" >> $GITHUB_ENV
-        echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/25.2.9658665" >> $GITHUB_ENV
+      uses: nttld/setup-ndk@v1
+      id: setup-ndk
+      with:
+        ndk-version: r25c          # NDK 25.2.9519653
+        add-to-path: false
+        local-cache: true
 
     # ============================================
     # Setup CMake
@@ -54,7 +53,9 @@ jobs:
     # ============================================
     - name: Configure CMake
       run: |
-        cmake -B build/${{ matrix.abi }}           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}           -DCMAKE_ANDROID_ARCH_ABI=${{ matrix.abi }}           -DCMAKE_ANDROID_NDK=${{ env.ANDROID_NDK }}           -DCMAKE_SYSTEM_NAME=Android           -DCMAKE_SYSTEM_VERSION=21           -DCMAKE_ANDROID_STL_TYPE=c++_static           -DCMAKE_TOOLCHAIN_FILE=${{ env.ANDROID_NDK }}/build/cmake/android.toolchain.cmake           -DANDROID_ABI=${{ matrix.abi }}           -DANDROID_PLATFORM=android-21           -DANDROID_STL=c++_static
+        cmake -B build/${{ matrix.abi }}           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}           -DCMAKE_ANDROID_ARCH_ABI=${{ matrix.abi }}           -DCMAKE_ANDROID_NDK=${{ steps.setup-ndk.outputs.ndk-path }}           -DCMAKE_SYSTEM_NAME=Android           -DCMAKE_SYSTEM_VERSION=21           -DCMAKE_ANDROID_STL_TYPE=c++_static           -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake           -DANDROID_ABI=${{ matrix.abi }}           -DANDROID_PLATFORM=android-21           -DANDROID_STL=c++_static
+      env:
+        ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
 
     - name: Build
       run: cmake --build build/${{ matrix.abi }} --config ${{ env.BUILD_TYPE }} -j$(nproc)
