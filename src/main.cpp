@@ -1,263 +1,182 @@
+#include <android/log.h>
 #include <jni.h>
-#include <android/input.h>
-#include <EGL/egl.h>
-#include <GLES3/gl3.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <chrono>
+#include <cstring>
 
-#include "pl/Hook.h"
-#include "pl/Gloss.h"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "AutoGG", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "AutoGG", __VA_ARGS__)
 
-#include "ImGui/imgui.h"
-#include "ImGui/backends/imgui_impl_opengl3.h"
-#include "ImGui/backends/imgui_impl_android.h"
+// ============================================================
+// TUDO EM UM ARQUIVO - MOD SIMPLES
+// Toque na tela = envia mensagem no chat
+// ============================================================
 
-/* =========================
-   Globals
-   ========================= */
-static bool g_Initialized = false;
-static int g_Width = 0, g_Height = 0;
+using GlossInitFn = void (*)(bool);
+using GlossHookFn = void* (*)(void*, void*, void**);
+using MotionEventFromJavaFn = void (*)(JNIEnv*, jobject, void*);
 
-static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
+static GlossInitFn g_glossInit = nullptr;
+static GlossHookFn g_glossHook = nullptr;
+static MotionEventFromJavaFn g_oldMotion = nullptr;
+static void* g_motionHook = nullptr;
+static JavaVM* g_vm = nullptr;
 
-/* =========================
-   Stopwatch State
-   ========================= */
-static bool g_Running = false;
-static double g_Elapsed = 0.0;
-static std::chrono::steady_clock::time_point g_LastTick;
+// Layout GameActivityMotionEvent (do seu mod original)
+static const int SRC_OFF = 0x04;
+static const int ACT_OFF = 0x08;
+static const int PTR_OFF = 0x38;
+static const int FIRST_PTR = 0x3C;
+static const int TOOL_OFF = 0x04;
+static const int X_OFF = 0x08;
+static const int Y_OFF = 0x0C;
 
-/* =========================
-   Input Hooks
-   ========================= */
-static void (*orig_Input1)(void*, void*, void*) = nullptr;
-static int32_t (*orig_Input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
+static const int SRC_TOUCH = 0x00001002;
+static const int TOOL_FINGER = 1;
+static const int ACT_DOWN = 0;
 
-static void hook_Input1(void* thiz, void* a1, void* a2) {
-    if (orig_Input1)
-        orig_Input1(thiz, a1, a2);
+static int g_cooldown = 0;
 
-    if (thiz && g_Initialized)
-        ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+// ============================================================
+// OBTEM ACTIVITY ATUAL VIA REFLECTION (ActivityThread)
+// ============================================================
+static jobject GetCurrentActivity(JNIEnv* env) {
+    // ActivityThread.currentActivityThread()
+    jclass activityThreadCls = env->FindClass("android/app/ActivityThread");
+    if (!activityThreadCls) return nullptr;
+    
+    jmethodID currentActivityThread = env->GetStaticMethodID(activityThreadCls, "currentActivityThread", "()Landroid/app/ActivityThread;");
+    if (!currentActivityThread) return nullptr;
+    
+    jobject activityThread = env->CallStaticObjectMethod(activityThreadCls, currentActivityThread);
+    if (!activityThread) return nullptr;
+    
+    // getApplication() -> Application (Context)
+    jmethodID getApplication = env->GetMethodID(activityThreadCls, "getApplication", "()Landroid/app/Application;");
+    if (!getApplication) return nullptr;
+    
+    jobject app = env->CallObjectMethod(activityThread, getApplication);
+    env->DeleteLocalRef(activityThread);
+    
+    return app; // Application é um Context, funciona para muitos métodos
 }
 
-static int32_t hook_Input2(void* thiz, void* a1, bool a2, long a3,
-                          uint32_t* a4, AInputEvent** event) {
-    int32_t result = orig_Input2
-        ? orig_Input2(thiz, a1, a2, a3, a4, event)
-        : 0;
-
-    if (result == 0 && event && *event && g_Initialized)
-        ImGui_ImplAndroid_HandleInputEvent(*event);
-
-    return result;
-}
-
-/* =========================
-   Hook Input
-   ========================= */
-static void HookInput() {
-    GHandle hInput = GlossOpen("libinput.so");
-    if (!hInput) return;
-
-    void* sym1 = (void*)GlossSymbol(
-        hInput,
-        "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE",
-        nullptr);
-
-    if (sym1)
-        GlossHook(sym1, (void*)hook_Input1, (void**)&orig_Input1);
-
-    void* sym2 = (void*)GlossSymbol(
-        hInput,
-        "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE",
-        nullptr);
-
-    if (sym2)
-        GlossHook(sym2, (void*)hook_Input2, (void**)&orig_Input2);
-}
-
-/* =========================
-   GL State Backup
-   ========================= */
-struct GLState {
-    GLint prog, tex, aTex, aBuf, eBuf, vao, fbo, vp[4], sc[4], bSrc, bDst;
-    GLboolean blend, cull, depth, scissor;
-};
-
-static void SaveGL(GLState& s) {
-    glGetIntegerv(GL_CURRENT_PROGRAM, &s.prog);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.tex);
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &s.aTex);
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.aBuf);
-    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &s.eBuf);
-    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.vao);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s.fbo);
-    glGetIntegerv(GL_VIEWPORT, s.vp);
-    glGetIntegerv(GL_SCISSOR_BOX, s.sc);
-    glGetIntegerv(GL_BLEND_SRC_ALPHA, &s.bSrc);
-    glGetIntegerv(GL_BLEND_DST_ALPHA, &s.bDst);
-    s.blend = glIsEnabled(GL_BLEND);
-    s.cull = glIsEnabled(GL_CULL_FACE);
-    s.depth = glIsEnabled(GL_DEPTH_TEST);
-    s.scissor = glIsEnabled(GL_SCISSOR_TEST);
-}
-
-static void RestoreGL(const GLState& s) {
-    glUseProgram(s.prog);
-    glActiveTexture(s.aTex);
-    glBindTexture(GL_TEXTURE_2D, s.tex);
-    glBindBuffer(GL_ARRAY_BUFFER, s.aBuf);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.eBuf);
-    glBindVertexArray(s.vao);
-    glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
-    glViewport(s.vp[0], s.vp[1], s.vp[2], s.vp[3]);
-    glScissor(s.sc[0], s.sc[1], s.sc[2], s.sc[3]);
-    glBlendFunc(s.bSrc, s.bDst);
-    s.blend ? glEnable(GL_BLEND) : glDisable(GL_BLEND);
-    s.cull ? glEnable(GL_CULL_FACE) : glDisable(GL_CULL_FACE);
-    s.depth ? glEnable(GL_DEPTH_TEST) : glDisable(GL_DEPTH_TEST);
-    s.scissor ? glEnable(GL_SCISSOR_TEST) : glDisable(GL_SCISSOR_TEST);
-}
-
-/* =========================
-   Stopwatch UI
-   ========================= */
-static void DrawMenu() {
-    if (g_Running) {
-        auto now = std::chrono::steady_clock::now();
-        g_Elapsed += std::chrono::duration<double>(now - g_LastTick).count();
-        g_LastTick = now;
+// ============================================================
+// ENVIA MENSAGEM NO CHAT VIA JNI
+// ============================================================
+static void SendChat(const char* msg) {
+    if (!g_vm) { LOGE("No JVM"); return; }
+    
+    JNIEnv* env = nullptr;
+    if (g_vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        LOGE("No JNIEnv"); return;
     }
-
-    int min = (int)(g_Elapsed / 60.0);
-    int sec = ((int)g_Elapsed) % 60;
-    int ms  = (int)((g_Elapsed - (int)g_Elapsed) * 100.0);
-
-    ImGui::SetNextWindowBgAlpha(0.6f);
-    ImGui::Begin("Stopwatch", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-
-    // ⏱ TIME 텍스트 제거
-    ImGui::Separator();
-    ImGui::Text("%02d:%02d:%02d", min, sec, ms);
-
-    ImGui::Spacing();
-
-    if (!g_Running) {
-        if (ImGui::Button("Start")) {
-            g_Running = true;
-            g_LastTick = std::chrono::steady_clock::now();
-        }
-    } else {
-        if (ImGui::Button("Pause")) {
-            g_Running = false;
+    
+    // Tenta obter Activity via reflection
+    jobject activity = GetCurrentActivity(env);
+    if (!activity) { LOGE("No activity"); return; }
+    
+    // Tenta enviar chat via MainActivity
+    jclass mc = env->FindClass("com/mojang/minecraftpe/MainActivity");
+    if (mc) {
+        jmethodID send = env->GetMethodID(mc, "nativeSendChatMessage", "(Ljava/lang/String;)V");
+        if (!send) send = env->GetMethodID(mc, "sendChatMessage", "(Ljava/lang/String;)V");
+        if (!send) send = env->GetMethodID(mc, "sendMessage", "(Ljava/lang/String;)V");
+        
+        if (send) {
+            jstring jmsg = env->NewStringUTF(msg);
+            env->CallVoidMethod(activity, send, jmsg);
+            env->DeleteLocalRef(jmsg);
+            LOGI("CHAT SENT: %s", msg);
+            env->DeleteLocalRef(activity);
+            return;
         }
     }
+    
+    LOGE("No chat method found");
+    env->DeleteLocalRef(activity);
+}
 
-    ImGui::SameLine();
-
-    if (ImGui::Button("Reset")) {
-        g_Running = false;
-        g_Elapsed = 0.0;
+// ============================================================
+// HOOK DO TOUCH
+// ============================================================
+static void HookMotion(JNIEnv* env, jobject ev, void* out) {
+    if (g_oldMotion) g_oldMotion(env, ev, out);
+    if (!out) return;
+    
+    char* p = (char*)out;
+    int src = *(int*)(p + SRC_OFF);
+    int act = *(int*)(p + ACT_OFF) & 0xFF;
+    int n = *(int*)(p + PTR_OFF);
+    
+    if (src != SRC_TOUCH || n < 1) return;
+    
+    char* ptr = p + FIRST_PTR;
+    int tool = *(int*)(ptr + TOOL_OFF);
+    if (tool != TOOL_FINGER) return;
+    
+    float x = *(float*)(ptr + X_OFF);
+    float y = *(float*)(ptr + Y_OFF);
+    
+    // Só envia no ACT_DOWN (quando toca) com cooldown
+    if (act == ACT_DOWN && g_cooldown <= 0) {
+        g_cooldown = 30; // ~0.5s cooldown
+        LOGI("TOUCH at (%.0f, %.0f) -> sending AUTO GG", x, y);
+        SendChat("AUTO GG");
     }
-
-    ImGui::End();
+    
+    if (g_cooldown > 0) g_cooldown--;
 }
 
-/* =========================
-   ImGui Setup
-   ========================= */
-static void Setup() {
-    if (g_Initialized || g_Width <= 0 || g_Height <= 0) return;
-
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr;
-
-    // ✅ 전체 UI 3배
-    io.FontGlobalScale = 3.0f;
-    ImGui::GetStyle().ScaleAllSizes(3.0f);
-
-    ImGui_ImplAndroid_Init();
-    ImGui_ImplOpenGL3_Init("#version 300 es");
-
-    // ✅ 원래 초록색 테마
-    ImGuiStyle& s = ImGui::GetStyle();
-    ImVec4* c = s.Colors;
-    c[ImGuiCol_WindowBg]      = ImVec4(0.05f, 0.05f, 0.05f, 0.85f);
-    c[ImGuiCol_Button]        = ImVec4(0.1f, 0.6f, 0.1f, 1.0f);
-    c[ImGuiCol_ButtonHovered] = ImVec4(0.2f, 0.8f, 0.2f, 1.0f);
-    c[ImGuiCol_ButtonActive]  = ImVec4(0.1f, 1.0f, 0.1f, 1.0f);
-    c[ImGuiCol_Text]          = ImVec4(0.9f, 1.0f, 0.9f, 1.0f);
-
-    g_Initialized = true;
+// ============================================================
+// JNI_OnLoad - CAPTURA A JVM
+// ============================================================
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    g_vm = vm;
+    LOGI("JNI_OnLoad: JVM captured");
+    return JNI_VERSION_1_6;
 }
 
-/* =========================
-   Render & EGL Hook
-   ========================= */
-static void Render() {
-    GLState s;
-    SaveGL(s);
-
-    ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2((float)g_Width, (float)g_Height);
-
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame(g_Width, g_Height);
-    ImGui::NewFrame();
-
-    DrawMenu();
-
-    ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
-    RestoreGL(s);
-}
-
-static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    if (!orig_eglSwapBuffers)
-        return EGL_FALSE;
-
-    EGLint w, h;
-    eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
-    eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-
-    if (w < 500 || h < 500)
-        return orig_eglSwapBuffers(dpy, surf);
-
-    g_Width = w;
-    g_Height = h;
-
-    Setup();
-    Render();
-
-    return orig_eglSwapBuffers(dpy, surf);
-}
-
-/* =========================
-   Thread Init
-   ========================= */
-static void* MainThread(void*) {
-    sleep(3);
-    GlossInit(true);
-
-    GHandle hEGL = GlossOpen("libEGL.so");
-    if (!hEGL) return nullptr;
-
-    void* swap = (void*)GlossSymbol(hEGL, "eglSwapBuffers", nullptr);
-    if (!swap) return nullptr;
-
-    GlossHook(swap, (void*)hook_eglSwapBuffers,
-              (void**)&orig_eglSwapBuffers);
-
-    HookInput();
+// ============================================================
+// INICIALIZAÇÃO
+// ============================================================
+static void* InitThread(void*) {
+    LOGI("=== AutoGG Simple Mod v1.2 ===");
+    LOGI("Touch anywhere on screen to send AUTO GG");
+    
+    // Espera preloader
+    void* pre = nullptr;
+    for (int i = 0; i < 120 && !pre; i++) {
+        pre = dlopen("libpreloader.so", RTLD_NOW | 0x00004);
+        if (!pre) usleep(250000);
+    }
+    if (!pre) { LOGE("No preloader"); return nullptr; }
+    
+    g_glossInit = (GlossInitFn)dlsym(pre, "GlossInit");
+    g_glossHook = (GlossHookFn)dlsym(pre, "GlossHook");
+    if (!g_glossInit || !g_glossHook) { LOGE("No Gloss exports"); return nullptr; }
+    g_glossInit(true);
+    
+    // Hook motion event
+    void* mc = dlopen("libminecraftpe.so", RTLD_NOW | 0x00004);
+    if (!mc) { LOGE("No libminecraftpe"); return nullptr; }
+    
+    void* motion = dlsym(mc, "GameActivityMotionEvent_fromJava");
+    if (!motion) { LOGE("No motion event"); return nullptr; }
+    
+    g_motionHook = g_glossHook(motion, (void*)HookMotion, (void**)&g_oldMotion);
+    if (!g_motionHook || !g_oldMotion) {
+        LOGE("Hook failed"); return nullptr;
+    }
+    
+    LOGI("HOOK OK! Touch screen to send AUTO GG");
     return nullptr;
 }
 
 __attribute__((constructor))
-void Init() {
+void ModConstructor() {
     pthread_t t;
-    pthread_create(&t, nullptr, MainThread, nullptr);
+    pthread_create(&t, nullptr, InitThread, nullptr);
+    pthread_detach(t);
 }
