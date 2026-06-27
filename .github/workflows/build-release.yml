@@ -1,143 +1,109 @@
-name: Build AutoGG Button Release
+name: Build Release
 
 on:
   push:
-    branches: [main, test]
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
 
-permissions:
-  contents: write
-
-concurrency:
-  group: autogg-button-release-${{ github.ref_name }}
-  cancel-in-progress: false
-
 env:
-  NDK_VERSION: 27.2.12479018
-  MODULE_NAME: AutoGGButton
+  BUILD_TYPE: Release
 
 jobs:
-  build-and-release:
+  build:
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        abi: [armeabi-v7a, arm64-v8a]
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    # ============================================
+    # Checkout do código
+    # ============================================
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+    # ============================================
+    # Setup Android NDK
+    # ============================================
+    - name: Setup Android NDK
+      uses: android-actions/setup-android@v3
 
-      - name: Install Android NDK r27c and Ninja
-        shell: bash
-        run: |
-          set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "ndk;${NDK_VERSION}"
-          # Ignora erros de repositórios externos (Microsoft 403)
-          sudo apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true || true
-          sudo apt-get install -y --allow-unauthenticated ninja-build zip || true
-          # Fallback: ninja já vem pré-instalado em ubuntu-latest
-          which ninja || echo "ninja not found, using make fallback"
+    - name: Install NDK
+      run: |
+        sdkmanager "ndk;25.2.9658665"
+        echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9658665" >> $GITHUB_ENV
+        echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/25.2.9658665" >> $GITHUB_ENV
 
-      - name: Configure Android ARM64 Release build
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Detecta se ninja está disponível, senão usa Unix Makefiles
-          if command -v ninja &> /dev/null; then
-            GENERATOR="Ninja"
-          else
-            GENERATOR="Unix Makefiles"
-          fi
-          echo "Using generator: $GENERATOR"
-          cmake -S . -B build-android -G "$GENERATOR" \
-            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-26 \
-            -DCMAKE_BUILD_TYPE=Release
+    # ============================================
+    # Setup CMake
+    # ============================================
+    - name: Setup CMake
+      uses: jwlawson/actions-setup-cmake@v2
+      with:
+        cmake-version: '3.22.1'
 
-      - name: Build .so
-        shell: bash
-        run: |
-          set -euo pipefail
-          cmake --build build-android --parallel
+    # ============================================
+    # Build
+    # ============================================
+    - name: Configure CMake
+      run: |
+        cmake -B build/${{ matrix.abi }}           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}           -DCMAKE_ANDROID_ARCH_ABI=${{ matrix.abi }}           -DCMAKE_ANDROID_NDK=${{ env.ANDROID_NDK }}           -DCMAKE_SYSTEM_NAME=Android           -DCMAKE_SYSTEM_VERSION=21           -DCMAKE_ANDROID_STL_TYPE=c++_static           -DCMAKE_TOOLCHAIN_FILE=${{ env.ANDROID_NDK }}/build/cmake/android.toolchain.cmake           -DANDROID_ABI=${{ matrix.abi }}           -DANDROID_PLATFORM=android-21           -DANDROID_STL=c++_static
 
-      - name: Prepare Release files
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist/package
-          cp "build-android/lib${MODULE_NAME}.so" "dist/package/lib${MODULE_NAME}.so"
-          echo "# AutoGG Button Mod" > dist/package/README.md
-          echo "" >> dist/package/README.md
-          echo "Botão flutuante para enviar mensagens automáticas no chat do Minecraft Bedrock." >> dist/package/README.md
-          echo "" >> dist/package/README.md
-          echo "## Como usar:" >> dist/package/README.md
-          echo "- **Clique**: Envia a mensagem configurada no chat" >> dist/package/README.md
-          echo "- **Segure/Pressione**: Abre o menu de configuração para mudar o texto" >> dist/package/README.md
-          echo "- **Arraste**: Move o botão pela tela" >> dist/package/README.md
-          echo "" >> dist/package/README.md
-          echo "## Instalação:" >> dist/package/README.md
-          echo "1. Coloque o .so no launcher (Toolbox, Inner Core, etc)" >> dist/package/README.md
-          echo "2. Inicie o Minecraft" >> dist/package/README.md
-          echo "3. O botão aparecerá automaticamente" >> dist/package/README.md
-          (cd dist/package && sha256sum "lib${MODULE_NAME}.so" > "lib${MODULE_NAME}.so.sha256")
-          (cd dist/package && zip -9 "../${MODULE_NAME}-arm64-v8a.zip" "lib${MODULE_NAME}.so" "lib${MODULE_NAME}.so.sha256" README.md)
-          cp "dist/package/lib${MODULE_NAME}.so" dist/
-          cp "dist/package/lib${MODULE_NAME}.so.sha256" dist/
+    - name: Build
+      run: cmake --build build/${{ matrix.abi }} --config ${{ env.BUILD_TYPE }} -j$(nproc)
 
-      - name: Publish only to rolling GitHub Release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
+    # ============================================
+    # Upload artifact
+    # ============================================
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: libstopwatch-${{ matrix.abi }}
+        path: build/${{ matrix.abi }}/libstopwatch.so
 
-          TAG="continuous-${GITHUB_REF_NAME}"
-          TITLE="${MODULE_NAME} continuous (${GITHUB_REF_NAME})"
-          NOTES="AutoGG Button - Botão flutuante com mensagem customizável para Minecraft Bedrock. Build automático ARM64."
+    # ============================================
+    # Release (apenas em tags)
+    # ============================================
+    - name: Upload to Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: build/${{ matrix.abi }}/libstopwatch.so
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          retry() {
-            local tries=0
-            local max=3
-            until "$@"; do
-              tries=$((tries + 1))
-              if [ "$tries" -ge "$max" ]; then
-                echo "Command failed after ${max} attempts: $*" >&2
-                return 1
-              fi
-              echo "Temporary GitHub operation failure; retrying ($((tries + 1))/${max})..." >&2
-              sleep $((tries * 5))
-            done
-          }
+  # ============================================
+  # Job para criar release com múltiplas ABIs
+  # ============================================
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            retry gh api --method PATCH \
-              -H "Accept: application/vnd.github+json" \
-              "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
-              -f sha="${GITHUB_SHA}" \
-              -F force=true \
-              --silent
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts/
 
-            retry gh release upload "$TAG" \
-              "dist/${MODULE_NAME}-arm64-v8a.zip" \
-              "dist/lib${MODULE_NAME}.so" \
-              "dist/lib${MODULE_NAME}.so.sha256" \
-              --clobber
+    - name: Create release archive
+      run: |
+        mkdir -p release/libs/armeabi-v7a
+        mkdir -p release/libs/arm64-v8a
+        cp artifacts/libstopwatch-armeabi-v7a/libstopwatch.so release/libs/armeabi-v7a/
+        cp artifacts/libstopwatch-arm64-v8a/libstopwatch.so release/libs/arm64-v8a/
+        cd release && zip -r ../stopwatch-hook-${{ github.ref_name }}.zip libs/
 
-            retry gh release edit "$TAG" \
-              --title "$TITLE" \
-              --notes "$NOTES" \
-              --prerelease
-          else
-            retry gh release create "$TAG" \
-              "dist/${MODULE_NAME}-arm64-v8a.zip" \
-              "dist/lib${MODULE_NAME}.so" \
-              "dist/lib${MODULE_NAME}.so.sha256" \
-              --target "$GITHUB_SHA" \
-              --title "$TITLE" \
-              --notes "$NOTES" \
-              --prerelease
-          fi
+    - name: Upload release archive
+      uses: softprops/action-gh-release@v2
+      with:
+        files: stopwatch-hook-${{ github.ref_name }}.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
