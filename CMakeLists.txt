@@ -6,12 +6,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_library(ANDROID_LOG_LIB log)
 find_library(ANDROID_DL_LIB dl)
+find_library(ANDROID_LIB android)
 
 add_library(${PROJECT_NAME} SHARED src/main.cpp)
 
 target_link_libraries(${PROJECT_NAME}
     ${ANDROID_LOG_LIB}
     ${ANDROID_DL_LIB}
+    ${ANDROID_LIB}
 )
 
 target_compile_options(${PROJECT_NAME} PRIVATE -O3 -fvisibility=hidden -Wall)
